@@ -85,6 +85,7 @@
       await chrome.storage.local.remove(Config.LOG_OLD_SETTING);
       await moveOldLog();
       await Store.trimUrls();
+      await Store.rekey(); // before the evaluations queued meanwhile are written with the new keys
     });
     writing = moved.catch((err) => console.warn('[ParaBene] Failed to move the old log:', err));
     return writing;

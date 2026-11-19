@@ -13,10 +13,10 @@
  *
  * Record:
  *   id        auto-incremented; a higher id is a newer record
- *   key       SHA-256 of what identifies the content, its site and its verdict with everything
- *             recorded about it (see keyText): the same text judged the same way on the same site
- *             again (a page reload) updates the record instead of adding one — `count` and
- *             `lastTime` tell how often and when last
+ *   key       SHA-256 of what identifies the content, its site and its verdict (see keyText): the
+ *             same text judged the same way on the same site again (a page reload) updates the
+ *             record instead of adding one — `count` and `lastTime` tell how often and when last,
+ *             `details` hold the numbers of the last evaluation
  *   time, lastTime   ISO timestamps of the first and the last evaluation
  *   url, host   the page's address without its query and fragment (see pageUrl), its host
  *   hidden    1 | 0 (a number, so it can be indexed)
@@ -102,16 +102,19 @@
   /* ---------------- identity of a record ---------------- */
 
   /**
-   * The same content on the same site with the same verdict is one record. The verdict is
-   * everything the record says about it, so a fallback to keywords, another model, threshold or
-   * score (to the two decimals shown) is a record of its own and the statistics keep its numbers.
-   * A picture verdict is identified by the picture.
+   * The same content on the same site with the same verdict is one record. The verdict is what
+   * decided it, so a fallback to keywords, another mode, model, threshold or reason is a record of
+   * its own and the statistics keep its numbers. The score is not part of it: the built-in model
+   * gives the same text slightly different scores from one evaluation to the next (0.86, then 0.87,
+   * depending on what else it judged), which would make one text many records; the record keeps
+   * the score of its last evaluation (add). A picture verdict is identified by the picture.
+   * "v3": records of the earlier identity ("v2", with the score) get the new key on update (rekey).
    */
   function keyText(entry) {
     const details = entry.details || {};
     const decimals = (value) => (typeof value === 'number' ? value.toFixed(2) : '');
     return [
-      'v2',
+      'v3',
       entry.host,
       entry.source,
       entry.hidden ? 'hidden' : 'shown',
@@ -120,7 +123,6 @@
       entry.reason,
       entry.category,
       details.model || '',
-      decimals(details.score),
       decimals(details.threshold),
       entry.image ? `image\n${entry.image}` : `text\n${entry.text}`,
     ].join('\n');
@@ -224,8 +226,9 @@
   /* ---------------- writing ---------------- */
 
   /**
-   * Adds evaluations (already sanitized). One that is already recorded is counted again.
-   * Then removes the oldest uncorrected records above Config.LOG_MAX_ENTRIES.
+   * Adds evaluations (already sanitized). One that is already recorded is counted again and keeps
+   * the numbers of this evaluation. Then removes the oldest uncorrected records above
+   * Config.LOG_MAX_ENTRIES.
    * Resolves with the number of new records.
    */
   async function add(entries) {
@@ -242,6 +245,7 @@
       if (known) {
         known.count = (known.count || 1) + 1;
         known.lastTime = entry.time;
+        if (entry.details) known.details = entry.details;
         if (entry.learned) known.learned = true;
         if (known.id !== undefined) store.put(known);
         seen.set(entry.key, known);
@@ -337,6 +341,62 @@
     if (changed) notify();
   }
 
+  /**
+   * One record for records that now share a key: the oldest stays, with the counts added up, the
+   * first and last times of them all, the numbers of the last evaluation, the newest correction,
+   * and "revealed" / "learned" when any of them had it.
+   */
+  function merged(key, group) {
+    const latest = group.reduce((a, b) => (String(b.lastTime || b.time) > String(a.lastTime || a.time) ? b : a));
+    const record = Object.assign({}, group[0], {
+      key,
+      count: group.reduce((sum, item) => sum + (item.count || 1), 0),
+      time: group.reduce((first, item) => (String(item.time) < String(first) ? item.time : first), group[0].time),
+      lastTime: latest.lastTime || latest.time,
+      revealed: group.some((item) => item.revealed === true),
+      learned: group.some((item) => item.learned === true),
+    });
+    if (latest.details) record.details = latest.details;
+    const corrected = group.filter((item) => item.label);
+    if (corrected.length) {
+      const last = corrected.reduce((a, b) => (String(b.labelTime || '') > String(a.labelTime || '') ? b : a));
+      record.label = last.label;
+      record.labelTime = last.labelTime;
+    }
+    return record;
+  }
+
+  /**
+   * On install and update: gives every record the key keyText gives it now. Records of an earlier
+   * identity (the score was part of it) that are the same content and verdict become one record
+   * (merged). Runs before new evaluations are written (src/log.js); does nothing when every key is
+   * current, and does not create the database when there is none.
+   */
+  async function rekey() {
+    if (typeof indexedDB.databases === 'function') {
+      const names = (await indexedDB.databases()).map((info) => info.name);
+      if (!names.includes(DB_NAME)) return;
+    }
+    const db = await open();
+    const records = await done(db.transaction(STORE).objectStore(STORE).getAll());
+    // The keys are computed first: a transaction does not survive waiting for crypto.subtle.
+    const groups = new Map(); // key → its records, oldest first
+    for (const record of records) {
+      const key = await keyOf(record);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(record);
+    }
+    const changes = [...groups].filter(([key, group]) => group.length > 1 || group[0].key !== key);
+    if (changes.length === 0) return;
+    const transaction = db.transaction(STORE, 'readwrite');
+    const store = transaction.objectStore(STORE);
+    // The merged records go first, so no new key meets the old record that still holds it.
+    for (const [, group] of changes) for (const record of group.slice(1)) store.delete(record.id);
+    for (const [key, group] of changes) store.put(merged(key, group));
+    await finished(transaction);
+    notify();
+  }
+
   /** The user's correction: "hide" | "show", or null to take it back. Resolves with the record. */
   async function setLabel(id, label) {
     const db = await open();
@@ -421,6 +481,7 @@
     add,
     markRevealed,
     trimUrls,
+    rekey,
     setLabel,
     clear,
     all,
